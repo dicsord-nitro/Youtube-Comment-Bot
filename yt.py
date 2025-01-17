@@ -1,150 +1,166 @@
-
-# -*- coding: utf-8 -*-
-
 import os
-
-import google.oauth2.credentials
-import requests
-from bs4 import BeautifulSoup
 import random
-import google_auth_oauthlib.flow
+import logging
+import asyncio
+import aiohttp
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from typing import List
+from bs4 import BeautifulSoup
+from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from google_auth_oauthlib.flow import InstalledAppFlow
+from dotenv import load_dotenv
+from time import sleep
 
-# The CLIENT_SECRETS_FILE variable specifies the name of a file that contains
-# the OAuth 2.0 information for this application, including its client_id and
-# client_secret.
-CLIENT_SECRETS_FILE = "client_secret.json"
+# Load environment variables from a .env file
+load_dotenv()
 
-# This OAuth 2.0 access scope allows for full read/write access to the
-# authenticated user's account and requires requests to use an SSL connection.
+# Configuration
+CLIENT_SECRETS_FILE = os.getenv("CLIENT_SECRETS_FILE", "client_secret.json")
 SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
 API_SERVICE_NAME = 'youtube'
 API_VERSION = 'v3'
+KEYWORDS_FILE = os.getenv("KEYWORDS_FILE", 'data/keywords.txt')
+COMMENTS_FILE = os.getenv("COMMENTS_FILE", 'data/comments.txt')
+LINKS_FILE = os.getenv("LINKS_FILE", 'data/links.txt')
+PROXY_URL = os.getenv("PROXY_URL")
+EMAIL_SENDER = os.getenv("EMAIL_SENDER")
+EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
+MAX_ERRORS_BEFORE_EMAIL = int(os.getenv("MAX_ERRORS_BEFORE_EMAIL", 5))
+
+# Logging configuration
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Global error counter
+error_count = 0
+
+def validate_file_content(file_path: str) -> List[str]:
+    """Validate that file exists and contains data."""
+    try:
+        if not os.path.exists(file_path):
+            logging.error(f"File not found: {file_path}")
+            return []
+        with open(file_path, 'r') as file:
+            content = file.readlines()
+        return [line.strip() for line in content if line.strip()]
+    except Exception as e:
+        logging.error(f"Error reading {file_path}: {e}")
+        return []
+
+async def fetch_url(session: aiohttp.ClientSession, url: str) -> str:
+    """Fetch the content of a URL asynchronously."""
+    try:
+        async with session.get(url, proxy=PROXY_URL) as response:
+            if response.status != 200:
+                logging.error(f"Failed to fetch URL {url} - Status Code: {response.status}")
+                return ""
+            return await response.text()
+    except Exception as e:
+        global error_count
+        error_count += 1
+        logging.error(f"Error fetching URL {url}: {e}")
+        return ""
 
 def get_authenticated_service():
-  flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, SCOPES)
-  credentials = flow.run_console()
-  return build(API_SERVICE_NAME, API_VERSION, credentials = credentials)
+    """Authenticate and return a YouTube API client."""
+    try:
+        flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, SCOPES)
+        credentials = flow.run_console()
+        return build(API_SERVICE_NAME, API_VERSION, credentials=credentials)
+    except Exception as e:
+        logging.error(f"Authentication failed: {e}")
+        return None
 
-def print_response(response):
-  print(response)
+async def scrape_video_links(session: aiohttp.ClientSession, keyword: str) -> List[str]:
+    """Scrape video links from YouTube based on a keyword."""
+    try:
+        url = f'https://www.youtube.com/results?q={keyword}&sp=CAISAggBUBQ%253D'
+        html_content = await fetch_url(session, url)
+        if not html_content:
+            return []
+        soup = BeautifulSoup(html_content, 'html.parser')
+        return [
+            link.get('href').replace("/watch?v=", "")
+            for link in soup.findAll('a', {'class': 'yt-uix-tile-link'})
+            if link.get('href')
+        ]
+    except Exception as e:
+        logging.error(f"Error scraping video links for keyword '{keyword}': {e}")
+        return []
 
-# Build a resource based on a list of properties given as key-value pairs.
-# Leave properties with empty values out of the inserted resource.
-def build_resource(properties):
-  resource = {}
-  for p in properties:
-    # Given a key like "snippet.title", split into "snippet" and "title", where
-    # "snippet" will be an object and "title" will be a property in that object.
-    prop_array = p.split('.')
-    ref = resource
-    for pa in range(0, len(prop_array)):
-      is_array = False
-      key = prop_array[pa]
+def comment_threads_insert(client, video_id: str, comment: str):
+    """Post a comment on a YouTube video."""
+    try:
+        body = {
+            'snippet': {
+                'videoId': video_id,
+                'topLevelComment': {
+                    'snippet': {'textOriginal': comment}
+                }
+            }
+        }
+        response = client.commentThreads().insert(part='snippet', body=body).execute()
+        logging.info(f"Comment posted on video {video_id}: {response}")
+    except HttpError as e:
+        global error_count
+        error_count += 1
+        logging.error(f"HTTP error occurred: {e}")
+    except Exception as e:
+        global error_count
+        error_count += 1
+        logging.error(f"An unexpected error occurred while posting a comment: {e}")
 
-      # For properties that have array values, convert a name like
-      # "snippet.tags[]" to snippet.tags, and set a flag to handle
-      # the value as an array.
-      if key[-2:] == '[]':
-        key = key[0:len(key)-2:]
-        is_array = True
+def send_email_notification():
+    """Send an email notification if too many errors occur."""
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = EMAIL_SENDER
+        msg['To'] = EMAIL_RECEIVER
+        msg['Subject'] = "Error Notification: YouTube Bot"
+        body = f"The bot encountered {error_count} errors. Please check the logs for details."
+        msg.attach(MIMEText(body, 'plain'))
 
-      if pa == (len(prop_array) - 1):
-        # Leave properties without values out of inserted resource.
-        if properties[p]:
-          if is_array:
-            ref[key] = properties[p].split(',')
-          else:
-            ref[key] = properties[p]
-      elif key not in ref:
-        # For example, the property is "snippet.title", but the resource does
-        # not yet have a "snippet" object. Create the snippet object here.
-        # Setting "ref = ref[key]" means that in the next time through the
-        # "for pa in range ..." loop, we will be setting a property in the
-        # resource's "snippet" object.
-        ref[key] = {}
-        ref = ref[key]
-      else:
-        # For example, the property is "snippet.description", and the resource
-        # already has a "snippet" object.
-        ref = ref[key]
-  return resource
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            server.send_message(msg)
+            logging.info("Error notification email sent.")
+    except Exception as e:
+        logging.error(f"Failed to send error notification email: {e}")
 
-# Remove keyword arguments that are not set
-def remove_empty_kwargs(**kwargs):
-  good_kwargs = {}
-  if kwargs is not None:
-    for key, value in kwargs.items():
-      if value:
-        good_kwargs[key] = value
-  return good_kwargs
+async def main():
+    """Main function to execute the workflow."""
+    global error_count
 
-def comment_threads_insert(client, properties, **kwargs):
-  # See full sample for function
-  resource = build_resource(properties)
+    client = get_authenticated_service()
+    if not client:
+        logging.error("Unable to initialize YouTube API client. Exiting.")
+        return
 
-  # See full sample for function
-  kwargs = remove_empty_kwargs(**kwargs)
+    keywords = validate_file_content(KEYWORDS_FILE)
+    comments = validate_file_content(COMMENTS_FILE)
 
-  response = client.commentThreads().insert(
-    body=resource,
-    **kwargs
-  ).execute()
+    if not keywords or not comments:
+        logging.error("Required data is missing. Exiting.")
+        return
 
-  return print_response(response)
+    async with aiohttp.ClientSession() as session:
+        for keyword in keywords:
+            video_links = await scrape_video_links(session, keyword)
+            for video_id in video_links:
+                if not video_id:
+                    continue
+                random_comment = random.choice(comments)
+                comment_threads_insert(client, video_id, random_comment)
 
-def scrape(keyword):
-    url = 'https://www.youtube.com/results?q={}&sp=CAISAggBUBQ%253D'.format(keyword)
-    source_code = requests.get(url)
-    plain_text = source_code.text
-    soup = BeautifulSoup(plain_text, 'html.parser')
-    f = open(r'data\links.txt', 'w')
-    for link in soup.findAll('a', {'class': 'yt-uix-tile-link'}):
-        href = link.get('href')
-        newhref = href.replace("/watch?v=", "")
-        f.write(newhref + '\n')
+                if error_count >= MAX_ERRORS_BEFORE_EMAIL:
+                    send_email_notification()
+                    error_count = 0  # Reset error counter after notification
 
-if __name__ == '__main__':
-  # When running locally, disable OAuthlib's HTTPs verification. When
-  # running in production *do not* leave this option enabled.
-  os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
-  client = get_authenticated_service()
-
-
-
-with open(r'data\comments.txt', 'r') as f:
-    foo = [line.strip() for line in f]
-
-# keyword
-with open(r'data\keywords.txt', 'r') as f:
-    foooo = [line.strip() for line in f]
-
-keywords = open(r'data\keywords.txt', 'r')
-x = 10
-while x < 20:
-    for line in keywords:
-        scrape(line)
-
-        with open(r"data\links.txt", 'r+') as f:
-            f.readline()
-            data = f.read()
-            f.seek(0)
-            f.write(data)
-            f.truncate()
-
-            try:
-                with open(r'data\links.txt', 'r') as f:
-                    urls = []
-                    for url in f:
-                        rand = random.choice(foo)
-
-                        comment_threads_insert(client,
-                        {'snippet.channelId': 'UCNlM-pgjmd0NNE5I6MzlEGg',
-                         'snippet.videoId': url,
-                         'snippet.topLevelComment.snippet.textOriginal': rand},
-                        part='snippet')
-            except:
-                pass
-            print("Scraping...")
+if __name__ == "__main__":
+    asyncio.run(main())
